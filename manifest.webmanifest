@@ -1,0 +1,17 @@
+{
+  "name": "수학도서관 얼리어답터",
+  "short_name": "얼리어답터",
+  "description": "예비고1 얼리어답터 응시 기록과 지원 유리 학교 판단",
+  "lang": "ko",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#F5F7F6",
+  "theme_color": "#0A4844",
+  "icons": [
+    { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
+    { "src": "icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+  ]
+}
