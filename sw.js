@@ -1,8 +1,8 @@
 // 수학도서관 얼리어답터 — 오프라인 캐시 (앱 화면 파일만 저장, 학생 자료는 Firestore가 따로 보관)
-const VERSION = 'ea-v1';
+const VERSION = 'ea-v2';
 const SHELL = [
   './', './index.html', './style.css', './app.js', './firebase-config.js',
-  './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'
+  './report-view.js', './report.css', './manifest.webmanifest', './icons/icon-192.png', './icons/icon-512.png', './icons/apple-touch-icon.png'
 ];
 
 self.addEventListener('install', e => {

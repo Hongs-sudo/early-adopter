@@ -4,8 +4,9 @@
 // - 자료: Firebase Firestore (students, settings/refs, staff) — 로그인한 원장·등록 선생님만 접근
 import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signInWithRedirect, getRedirectResult, onAuthStateChanged, signOut } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
-import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, onSnapshot, updateDoc, setDoc, deleteDoc, getDoc, writeBatch } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
+import { initializeFirestore, persistentLocalCache, persistentMultipleTabManager, collection, doc, onSnapshot, updateDoc, setDoc, deleteDoc, getDoc, writeBatch, serverTimestamp, Timestamp } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
 import { firebaseConfig, OWNER_EMAIL } from './firebase-config.js';
+import { renderA4 } from './report-view.js';
 
 const fbApp = initializeApp(firebaseConfig);
 const auth = getAuth(fbApp);
@@ -48,7 +49,8 @@ const S = {
   tab: 'overview', mtab: 'home', curId: null, mDetail: false, teacher: '전체', search: '', mFilter: 'all', tfilter: '전체',
   entry: { sid: null, r: 1, sch: '', newSch: '', y: '', score: '', stage: '1', date: '' },
   editInfo: false, armed: null, memoDraft: {}, sheet: null, staffForm: { email: '', name: '' }, importPending: null,
-  online: navigator.onLine, installEvt: null
+  online: navigator.onLine, installEvt: null,
+  reports: [], repLoaded: false, seenConsult: new Set(), repDraft: {}
 };
 let unsubs = [];
 const $app = document.getElementById('app');
@@ -153,6 +155,186 @@ function reasonsFor(s, an) {
   return reasons;
 }
 
+// ===== 학부모 리포트 =====
+const REPORT_DAYS = 30;
+const kindOf = t => t[1] === '공학' ? '공학' : t[1] === '남' ? '남고' : t[1] === '여' ? '여고' : '';
+const repOpt = s => ({ grade: true, order: true, notes: true, ...(s.reportOpt || {}) });
+// 2차(4~6회) 점수까지 들어와 응시학교마다 시험지가 2장 이상일 때만 최종 판단
+const isFinal = s => analyze(s).verdict.status === 'done' && recs(s).some(x => x.r >= 4 && x.score != null);
+const issuedTxt = () => { const d = new Date(); return `${d.getFullYear()}. ${d.getMonth() + 1}. ${d.getDate()}`; };
+function buildSnapshot(s) {
+  const an = analyze(s), v = an.verdict, o = repOpt(s);
+  const rows = an.rows.filter(r => r.n > 0).map(r => ({
+    sch: r.sch, kind: kindOf(r.t), app: r.t[8],
+    scores: r.ps.map(x => ({ s: x.score, r: x.r, y: x.y || null })),
+    avg: r.avg, m: r.ref ? r.ref.m : null, sd: r.ref ? r.ref.sd : null, top: r.top, g: r.g,
+    v: r.blocked ? 'blocked' : r.v === 'good' ? 'good' : r.top == null ? 'none' : 'next'
+  })).sort((a, b) => (a.v === 'good' ? -1 : b.v === 'good' ? 1 : 0) || (a.v === 'blocked') - (b.v === 'blocked') || ((a.top ?? 999) - (b.top ?? 999)));
+  const notes = rows.filter(r => r.v !== 'blocked').map(r => { const t = T(r.sch); return { sch: r.sch, kind: kindOf(t), style: ['미분류', '자료없음'].includes(t[0]) ? '' : t[9], n1: t[2], seats: t[3], mid: t[12], perf: t[5] }; });
+  return {
+    v: 1, name: s.name, middle: s.middle || '', teacher: s.teacher || '', issued: issuedTxt(),
+    showGrade: o.grade, showOrder: o.order, showNotes: o.notes,
+    comment: String(s.reportComment || '').trim().slice(0, 400),
+    best: v.best ? { sch: v.best.sch, top: v.best.top, g: v.best.g } : { sch: '–', top: null, g: null },
+    order: (v.general || []).map(r => r.sch),
+    special: rows.filter(r => r.v !== 'blocked' && r.app && r.app !== '일반').map(r => `${r.sch} (${r.app})`),
+    papers: rows.reduce((n, r) => n + r.scores.length, 0),
+    rows: rows.map(({ app, ...r }) => r), notes
+  };
+}
+const snapKey = d => JSON.stringify({ ...d, issued: '' });
+const repFor = sid => S.reports.filter(r => r.sid === sid).sort((a, b) => (b.sentAt?.toMillis?.() || Date.now()) - (a.sentAt?.toMillis?.() || Date.now()))[0] || null;
+const isMine = r => S.role === 'owner' || !S.myName || r.teacher === S.myName;
+const pendingConsults = () => S.reports.filter(r => r.consult === 'requested' && !r.handledAt && isMine(r)).sort((a, b) => (a.consultAt?.toMillis?.() || 0) - (b.consultAt?.toMillis?.() || 0));
+const tsDate = ts => ts && ts.toDate ? ts.toDate() : null;
+const dt = ts => { const d = tsDate(ts); if (!d) return ts ? '방금' : '–'; const h = d.getHours(); return `${d.getMonth() + 1}/${d.getDate()} ${h < 12 ? '오전' : '오후'} ${h % 12 || 12}:${pad(d.getMinutes())}`; };
+const dOnly = ts => { const d = tsDate(ts); return d ? `${d.getMonth() + 1}월 ${d.getDate()}일` : '–'; };
+const expired = r => { const d = tsDate(r.expiresAt); return d ? d.getTime() < Date.now() : false; };
+const linkFor = key => new URL(`r/?k=${key}`, location.href.replace(/[?#].*$/, '')).href;
+const shareText = s => `[수학도서관] ${s.name} 학생의 얼리어답터 최종 결과 리포트입니다. 확인하신 뒤 맨 아래 '리포트를 확인했습니다'를 눌러 주세요. (받으신 날부터 한 달간 열 수 있습니다)`;
+function makeKey() {
+  const a = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789', b = new Uint8Array(24);
+  crypto.getRandomValues(b); return Array.from(b, x => a[x % a.length]).join('');
+}
+function repState(s) {
+  const r = repFor(s.id);
+  if (!r) return isFinal(s) ? { k: 'ready', t: '보낼 수 있음', c: 'p-warn' } : { k: 'none', t: '최종 판단 전', c: 'p-none' };
+  if (r.consult === 'requested' && !r.handledAt) return { k: 'consult', t: '상담 요청', c: 'p-bad', r };
+  if (expired(r)) return { k: 'expired', t: '기간 지남', c: 'p-none', r };
+  if (r.confirmedAt) return { k: 'confirmed', t: r.consult === 'requested' ? '확인 · 상담 처리됨' : '확인 완료', c: 'p-good', r };
+  if (r.views) return { k: 'viewed', t: `열어 봄 ${r.views}회`, c: 'p-none', r };
+  return { k: 'sent', t: '안 열어 봄', c: 'p-warn', r };
+}
+// 링크 만들기 / 내용 새로 고쳐 다시 보내기 → 한 달 기간 새로 시작
+function sendReport(s) {
+  if (!isFinal(s)) { toast('2차 점수까지 들어와 최종 판단이 나와야 보낼 수 있습니다', true); return null; }
+  const data = buildSnapshot(s), exp = Timestamp.fromMillis(Date.now() + REPORT_DAYS * 864e5), cur = repFor(s.id), by = (S.user.email || '').toLowerCase();
+  const fresh = { data, sentBy: by, sentAt: serverTimestamp(), expiresAt: exp, views: 0, firstViewAt: null, lastViewAt: null, confirmedAt: null, consult: null, consultAt: null, handledAt: null, name: s.name, teacher: s.teacher || '' };
+  if (cur) {
+    const hist = [...(cur.history || []), { version: cur.version || 1, sentAt: cur.sentAt || null, views: cur.views || 0, confirmedAt: cur.confirmedAt || null, consult: cur.consult || null }].slice(-5);
+    updateDoc(doc(db, 'reports', cur.id), { ...fresh, version: (cur.version || 1) + 1, history: hist }).catch(e => toast(failMsg(e), true));
+    Object.assign(cur, fresh, { version: (cur.version || 1) + 1 });
+    return cur.id;
+  }
+  const key = makeKey();
+  setDoc(doc(db, 'reports', key), { ...fresh, sid: s.id, version: 1, createdBy: by, createdAt: serverTimestamp(), history: [] }).catch(e => toast(failMsg(e), true));
+  S.reports.push({ id: key, sid: s.id, ...fresh, version: 1 });
+  return key;
+}
+async function copyText(txt, okMsg) {
+  try { await navigator.clipboard.writeText(txt); toast(okMsg); }
+  catch (e) { window.prompt('아래 내용을 길게 눌러 복사하세요', txt); }
+}
+function linkAction(s, mode) {
+  let r = repFor(s.id), key = r && !expired(r) ? r.id : null;
+  if (!key) { key = sendReport(s); if (!key) return; }
+  const url = linkFor(key), text = shareText(s);
+  if (mode === 'share' && navigator.share) navigator.share({ title: '수학도서관 얼리어답터 결과 리포트', text, url }).catch(() => {});
+  else if (mode === 'link') copyText(url, '링크를 복사했습니다');
+  else copyText(`${text}\n${url}`, '안내 문구와 링크를 복사했습니다. 카톡·문자에 붙여 넣으세요');
+  render();
+}
+function stageA4(s) {
+  let el = document.getElementById('rpStage');
+  if (!el) { el = document.createElement('div'); el.id = 'rpStage'; el.setAttribute('aria-hidden', 'true'); document.body.appendChild(el); }
+  el.innerHTML = renderA4(buildSnapshot(s));
+  return el.firstElementChild;
+}
+// 이미지에 넣을 글꼴: 리포트에 쓰인 글자만 담은 작은 글꼴을 받아 이미지 안에 넣음
+async function fontCSSFor(text) {
+  const chars = [...new Set((text + '0123456789.%·→±()').replace(/\s/g, ''))].join('');
+  const url = 'https://fonts.googleapis.com/css2?family=Noto+Serif+KR:wght@700&family=IBM+Plex+Sans+KR:wght@400;500;600;700&display=block&text=' + encodeURIComponent(chars);
+  let css = await (await fetch(url)).text();
+  const urls = [...new Set([...css.matchAll(/url\((https:[^)]+)\)/g)].map(m => m[1]))];
+  const data = await Promise.all(urls.map(u => fetch(u).then(r => r.blob()).then(b => new Promise(res => { const fr = new FileReader(); fr.onload = () => res(fr.result); fr.readAsDataURL(b); }))));
+  urls.forEach((u, i) => { css = css.split(u).join(data[i]); });
+  return css;
+}
+let h2i;
+const loadH2I = () => h2i || (h2i = import('https://cdn.jsdelivr.net/npm/html-to-image@1.11.11/+esm'));
+function copyImage(s) {
+  if (!isFinal(s)) { toast('최종 판단이 나온 뒤 이미지로 복사할 수 있습니다', true); return; }
+  const node = stageA4(s);
+  const make = () => Promise.all([loadH2I(), fontCSSFor(node.textContent).catch(() => '')]).then(([m, css]) => m.toBlob(node, { pixelRatio: 2, backgroundColor: '#ffffff', fontEmbedCSS: css, skipFonts: !css }));
+  const fileName = `${s.name}_얼리어답터_리포트.png`;
+  toast('이미지를 만드는 중…');
+  if (navigator.clipboard && window.ClipboardItem) {
+    const p = make();
+    navigator.clipboard.write([new ClipboardItem({ 'image/png': p })])
+      .then(() => toast('리포트 이미지를 복사했습니다. 카톡 대화창에 붙여 넣으세요'))
+      .catch(() => p.then(b => { download(fileName, b, 'image/png'); toast('복사가 안 되는 브라우저라 이미지 파일로 저장했습니다'); }).catch(() => toast('이미지를 만들지 못했습니다', true)));
+  } else make().then(b => { download(fileName, b, 'image/png'); toast('이미지 파일로 저장했습니다'); }).catch(() => toast('이미지를 만들지 못했습니다', true));
+}
+function printReport(s) {
+  if (!isFinal(s)) { toast('최종 판단이 나온 뒤 인쇄할 수 있습니다', true); return; }
+  let el = document.getElementById('rpPrint');
+  if (!el) { el = document.createElement('div'); el.id = 'rpPrint'; document.body.appendChild(el); }
+  el.innerHTML = renderA4(buildSnapshot(s));
+  document.title = `${s.name}_얼리어답터_리포트`;
+  document.body.classList.add('printing');
+  setTimeout(() => window.print(), 60);
+}
+window.addEventListener('afterprint', () => { document.body.classList.remove('printing'); document.title = '얼리어답터 관리 · 수학도서관'; });
+function notifyConsult(r) {
+  const msg = `${r.name} 학부모님이 상담을 요청했습니다${r.teacher ? ` (담당 ${r.teacher})` : ''}`;
+  toast(msg);
+  if ('Notification' in window && Notification.permission === 'granted') {
+    const opt = { body: msg, icon: 'icons/icon-192.png', tag: 'consult-' + r.id };
+    navigator.serviceWorker?.ready.then(reg => reg.showNotification('상담 요청 · 얼리어답터', opt)).catch(() => { try { new Notification('상담 요청 · 얼리어답터', opt); } catch (e) {} });
+  }
+}
+function markHandled(id) {
+  updateDoc(doc(db, 'reports', id), { handledAt: serverTimestamp(), handledBy: (S.user.email || '').toLowerCase() }).then(() => toast('상담 처리 완료로 표시했습니다')).catch(e => toast(failMsg(e), true));
+  const r = S.reports.find(x => x.id === id); if (r) r.handledAt = true;
+}
+function consultBanner() {
+  const list = pendingConsults(); if (!list.length) return '';
+  return `<div class="consult-box" role="region" aria-label="상담 요청"><b>학부모 상담 요청 ${list.length}건</b>
+    ${list.map(r => `<div class="consult-row"><span><b>${esc(r.name)}</b> <span class="src">${esc(r.teacher || '')} · ${dt(r.consultAt)}</span></span>
+      <span class="row"><button class="btn ghost small" data-act="openStudent" data-id="${r.sid}">학생 보기</button><button class="btn small" data-act="handled" data-v="${r.id}">처리 완료</button></span></div>`).join('')}</div>`;
+}
+function reportRecord(r) {
+  if (!r) return '<p class="src" style="margin:0">아직 보내지 않았습니다.</p>';
+  const consult = r.consult === 'requested' ? `<b class="flag-bad">요청함</b> ${dt(r.consultAt)}${r.handledAt ? ' · 처리 완료' : ''}` : r.consult === 'declined' ? '괜찮다고 함' : '–';
+  return `<dl class="kv rp-kv">
+    <dt>보낸 때</dt><dd>${dt(r.sentAt)}${(r.version || 1) > 1 ? ` <span class="src">(${r.version}번째)</span>` : ''}</dd>
+    <dt>링크 기간</dt><dd>${expired(r) ? '<span class="flag">기간 지남</span>' : dOnly(r.expiresAt) + '까지'}</dd>
+    <dt>열람</dt><dd>${r.views ? `${r.views}회 · 처음 ${dt(r.firstViewAt)} · 마지막 ${dt(r.lastViewAt)}` : '아직 안 열어 봄'}</dd>
+    <dt>확인 버튼</dt><dd>${r.confirmedAt ? dt(r.confirmedAt) : '–'}</dd>
+    <dt>상담 요청</dt><dd>${consult}</dd></dl>`;
+}
+function reportPanel(s) {
+  const fin = isFinal(s), r = repFor(s.id), o = repOpt(s), snap = buildSnapshot(s);
+  const changed = r && fin && snapKey(r.data || {}) !== snapKey(snap);
+  const draft = S.repDraft[s.id] ?? s.reportComment ?? '';
+  const sexWarn = !s.sex && snap.rows.some(x => x.kind === '남고' || x.kind === '여고');
+  return `<div class="panel box rp-panel"><div class="row" style="justify-content:space-between"><h3 style="margin:0">학부모 리포트</h3><span class="pill ${repState(s).c}">${repState(s).t}</span></div>
+  <div class="rp-grid">
+    <div class="rp-prev-wrap"><span class="src">A4 미리보기 · 보내는 내용 그대로${fin ? '' : ' (최종 판단 전)'}</span><div class="rp-prev">${renderA4(snap)}</div></div>
+    <div class="rp-ctrl">
+      ${fin ? '' : `<div class="banner">2차(4~6회) 점수까지 들어와 응시학교마다 시험지가 2장 이상이 되면 최종 판단이 나오고, 그때 보낼 수 있습니다. 지금은 미리보기만 됩니다.</div>`}
+      ${sexWarn ? `<div class="banner warnb">성별이 비어 있어 남고·여고가 함께 나옵니다. 위 학생 정보에서 성별을 넣어 주세요.</div>` : ''}
+      <fieldset class="rp-opts"><legend>리포트에 넣을 것</legend>
+        <label><input type="checkbox" data-change="repOpt" data-id="${s.id}" data-k="grade" ${o.grade ? 'checked' : ''}> 참고 등급</label>
+        <label><input type="checkbox" data-change="repOpt" data-id="${s.id}" data-k="order" ${o.order ? 'checked' : ''}> 원서 지망 순서 제안</label>
+        <label><input type="checkbox" data-change="repOpt" data-id="${s.id}" data-k="notes" ${o.notes ? 'checked' : ''}> 학교별 알아 둘 점</label></fieldset>
+      <label for="repCmt">학부모에게 보일 선생님 의견 <span class="src">상담 메모와 따로 저장 · 비우면 칸이 빠짐 · 400자까지</span>
+        <textarea id="repCmt" rows="4" maxlength="400" data-bind="repDraft.${s.id}" style="width:100%">${esc(draft)}</textarea></label>
+      <div class="row"><button class="btn ghost small" data-act="saveRepCmt" data-id="${s.id}">의견 저장</button>${S.repDraft[s.id] != null && S.repDraft[s.id] !== (s.reportComment || '') ? '<span class="flag">저장 안 된 수정이 있습니다</span>' : ''}</div>
+      <div class="rp-actions">
+        <button class="btn ghost" data-act="repImage" data-id="${s.id}" ${fin ? '' : 'disabled'}>이미지로 복사</button>
+        <button class="btn ghost" data-act="repPrint" data-id="${s.id}" ${fin ? '' : 'disabled'}>인쇄 · PDF 저장</button>
+        ${r && !expired(r) ? `<button class="btn" data-act="repCopy" data-id="${s.id}">안내 문구와 링크 복사</button>` : `<button class="btn" data-act="repCopy" data-id="${s.id}" ${fin ? '' : 'disabled'}>${r ? '새 링크 만들어 복사' : '학부모 링크 만들기'}</button>`}
+      </div>
+      ${r ? `<div class="row"><input class="rp-url" readonly value="${esc(linkFor(r.id))}" aria-label="학부모 링크"><button class="btn ghost small" data-act="repLink" data-id="${s.id}">링크만 복사</button><a class="btn ghost small" href="${esc(linkFor(r.id))}" target="_blank" rel="noopener">열어 보기</a></div>` : ''}
+      ${changed ? `<div class="banner">보낸 뒤 점수나 의견이 바뀌었습니다. <button class="btn small" data-act="repResend" data-id="${s.id}">내용 새로 고쳐 다시 보내기</button><div class="src">같은 링크에 새 내용이 들어가고, 한 달 기간과 열람·확인 기록이 새로 시작됩니다.</div></div>` : ''}
+      <div class="rp-rec"><b>학부모 확인 기록</b>${reportRecord(r)}
+        <div class="row">${r && r.consult === 'requested' && !r.handledAt ? `<button class="btn small" data-act="handled" data-v="${r.id}">상담 처리 완료</button>` : ''}
+        ${r && !changed && fin ? `<button class="btn ghost small" data-act="repResend" data-id="${s.id}">${expired(r) ? '기간 새로 시작해 다시 보내기' : '다시 보내기 (기간 새로 시작)'}</button>` : ''}
+        ${r ? `<button class="btn danger small" data-act="repRevoke" data-v="${r.id}">${S.armed === 'rev:' + r.id ? '한 번 더 누르면 링크 끊김' : '링크 끊기'}</button>` : ''}</div></div>
+    </div></div></div>`;
+}
+
 // ===== 저장 =====
 let toastTimer;
 function toast(msg, err) {
@@ -193,6 +375,13 @@ function startListeners() {
   unsubs.push(onSnapshot(doc(db, 'settings', 'refs'), snap => {
     const d = snap.exists() ? snap.data() : {};
     S.refInput = d.refs || {}; S.refMode = d.mode || '2yr'; render();
+  }, () => {}));
+  unsubs.push(onSnapshot(collection(db, 'reports'), snap => {
+    S.reports = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+    const fresh = S.reports.filter(r => r.consult === 'requested' && !r.handledAt && isMine(r));
+    if (S.repLoaded) fresh.forEach(r => { const k = r.id + ':' + (r.version || 1); if (!S.seenConsult.has(k)) notifyConsult(r); });
+    fresh.forEach(r => S.seenConsult.add(r.id + ':' + (r.version || 1)));
+    S.repLoaded = true; render();
   }, () => {}));
   if (isOwner()) unsubs.push(onSnapshot(collection(db, 'staff'), snap => {
     S.staff = snap.docs.map(d => ({ email: d.id, ...d.data() })).sort((a, b) => String(a.name).localeCompare(String(b.name), 'ko')); render();
@@ -281,16 +470,18 @@ function overviewView() {
   const list = S.students.filter(s => S.teacher === '전체' || s.teacher === S.teacher);
   return `<h2>전체 현황</h2>
   <p class="sub">학생 1명당 응시학교 3곳 × 시험지 2장 = 6회. 1차는 1~3회, 2차는 4~6회입니다. 성별은 표에서 바로 고를 수 있습니다.</p>
+  ${consultBanner()}
   <div class="tiles">
     <div class="tile"><div class="k">참여 학생</div><div class="v">${c.n}<small> 명 · 성별 미입력 ${c.noSex}</small></div></div>
     <div class="tile"><div class="k">1차(1~3회) 응시학교 확정</div><div class="v">${c.scheduled}<small> / ${c.n * 3}</small></div></div>
     <div class="tile"><div class="k">점수 입력</div><div class="v">${c.filled}<small> / ${c.n * 6}장 · 연도 미입력 ${c.noYear}</small></div></div>
     <div class="tile"><div class="k">판단 가능 학생</div><div class="v">${c.judged}<small> 명</small></div></div>
+    <div class="tile"><div class="k">학부모 리포트 확인</div><div class="v">${S.reports.filter(r => r.confirmedAt).length}<small> / 보냄 ${S.reports.length}</small></div></div>
   </div>
   <div class="filters"><span class="empty" style="font-size:13px">담당</span>${ts.map(t => `<button class="chip" aria-pressed="${t === S.teacher}" data-act="teacher" data-v="${esc(t)}">${esc(t)}</button>`).join('')}
     ${isOwner() ? `<span style="margin-left:auto"><button class="btn small" data-act="addStudent">+ 학생 추가</button></span>` : ''}</div>
   ${list.length ? `<div class="panel scroll"><table>
-    <thead><tr><th>#</th><th>학생</th><th>성별</th><th>중학교</th><th>담당</th><th>희망학교 (참고)</th><th>응시학교 (판단 기준)</th><th>회차 진행</th><th>입력</th><th>판단</th></tr></thead>
+    <thead><tr><th>#</th><th>학생</th><th>성별</th><th>중학교</th><th>담당</th><th>희망학교 (참고)</th><th>응시학교 (판단 기준)</th><th>회차 진행</th><th>입력</th><th>판단</th><th>학부모 리포트</th></tr></thead>
     <tbody>${list.map(s => {
       const sch = schoolsOf(s), rs = recs(s);
       const hopes = (s.hopes || []).filter(Boolean).map(h => `<span class="hope ${sch.includes(h) ? '' : 'miss'}">${esc(h)}</span>`).join('') || '<span class="empty">–</span>';
@@ -299,7 +490,7 @@ function overviewView() {
         <td>${sexSelect(s, 'sm')}</td><td>${esc(s.middle || '')}</td><td>${esc(s.teacher || '')}</td><td>${hopes}</td>
         <td>${sch.map(esc).join(' · ') || '<span class="empty">미정</span>'}${sch.length < 3 ? ` <span class="flag">${3 - sch.length}곳 미정</span>` : ''}</td>
         <td><span class="src">1차</span> <span class="dots">${[1, 2, 3].map(dot).join('')}</span> <span class="src">2차</span> <span class="dots">${[4, 5, 6].map(dot).join('')}</span></td>
-        <td>${rs.filter(x => x.score != null).length}/6</td><td>${verdictPill(s)}</td></tr>`;
+        <td>${rs.filter(x => x.score != null).length}/6</td><td>${verdictPill(s)}</td><td>${(st => `<span class="pill ${st.c}">${st.t}</span>`)(repState(s))}</td></tr>`;
     }).join('')}</tbody></table></div>
     <p class="src" style="margin-top:8px">● 점수 입력됨 · 골드 테두리 = 학교만 잡힘 · 점선 희망학교 = 응시하지 않음</p>` : emptyStudents()}`;
 }
@@ -380,7 +571,8 @@ function detailBig(s) {
     <div class="panel scroll"><table>
       <thead><tr><th>응시학교</th><th>유형</th><th>1등급 자리</th><th>중간고사<br>(서·논술)</th><th>확인할 점</th></tr></thead>
       <tbody>${an.rows.map(r => `<tr><td><b>${esc(r.sch)}</b><div class="src" style="white-space:normal;max-width:220px">${esc(r.t[9] || '')}</div></td><td>${typeTag(r.t[0])}</td><td>${r.t[3] ? '약 ' + r.t[3] + '명' : '–'}</td><td>${midTxt(r.t)}</td><td class="wrap"><div class="warnlist">${warnsFor(s, r.sch).map(w => `<span class="pill p-warn">${esc(w)}</span>`).join('') || '<span class="empty">–</span>'}</div></td></tr>`).join('') || '<tr><td colspan="5" class="empty">–</td></tr>'}</tbody></table></div>
-  </div>`;
+  </div>
+  ${reportPanel(s)}`;
 }
 
 // ----- 점수 입력 (공용 로직) -----
@@ -484,6 +676,12 @@ function installBlock() {
     <li><b>아이패드·아이폰 (사파리)</b>: 아래쪽 또는 위쪽의 공유 버튼 → <b>홈 화면에 추가</b></li>
     <li><b>안드로이드 (크롬)</b>: 오른쪽 위 ⋮ 메뉴 → <b>앱 설치</b> 또는 <b>홈 화면에 추가</b></li></ul>`;
 }
+function notifyBlock() {
+  const ok = 'Notification' in window;
+  const p = ok ? Notification.permission : 'unsupported';
+  return `<p style="margin:0 0 10px">학부모가 리포트에서 '상담 요청하기'를 누르면 ${S.role === 'owner' ? '모든 학생의' : '내 담당 학생의'} 요청이 홈·전체 현황 맨 위에 뜹니다. 이 기기에서 알림도 받으려면 켜 주세요. 앱이 열려 있거나 뒤에 켜져 있을 때 울립니다.</p>
+  ${p === 'granted' ? '<span class="pill p-good">이 기기 알림 켜짐</span>' : p === 'denied' ? '<span class="pill p-none">알림이 막혀 있습니다 · 브라우저 사이트 설정에서 허용해 주세요</span>' : p === 'unsupported' ? `<span class="pill p-none">${isIOS && !isStandalone() ? '아이폰·아이패드는 홈 화면에 추가한 앱에서 켤 수 있습니다' : '이 브라우저는 알림을 지원하지 않습니다'}</span>` : '<button class="btn small" data-act="notifyOn">이 기기에서 알림 받기</button>'}`;
+}
 function settingsView() {
   const own = isOwner();
   return `<h2>설정</h2>
@@ -491,6 +689,7 @@ function settingsView() {
     <div class="panel box"><h3>내 계정</h3><p style="margin:0 0 10px">${esc(S.user.email)} · ${own ? '원장 (모든 권한)' : esc(S.myName || '선생님')}</p><button class="btn ghost small" data-act="logout">로그아웃</button></div>
     <div class="panel box"><h3>앱 설치</h3>${installBlock()}</div>
   </div>
+  <div class="panel box" style="margin-top:16px"><h3>상담 요청 알림</h3>${notifyBlock()}</div>
   ${own ? `<div class="panel box" style="margin-top:16px"><h3>선생님 관리</h3>
     <p class="sub" style="margin-bottom:10px">여기에 등록한 구글 이메일만 앱에 들어올 수 있습니다. 이름은 학생의 '담당'과 같게 적으면 핸드폰에서 '내 담당' 학생만 따로 볼 수 있습니다.</p>
     <div class="row" style="margin-bottom:12px">
@@ -534,9 +733,10 @@ function phoneView() {
   if (S.mtab === 'students' && S.mDetail && stu(S.curId)) body = mDetail(stu(S.curId));
   else body = { home: mHome, entry: mEntry, students: mStudents, more: mMore }[S.mtab]();
   const tabs = [['home', '홈', 'home'], ['entry', '점수 입력', 'edit'], ['students', '학생', 'people'], ['more', '더보기', 'more']];
+  const nCon = pendingConsults().length;
   return `<div class="m">${body}</div>
-  <nav class="tabbar" aria-label="주요 메뉴">${tabs.map(([k, l, ic]) => `<button aria-current="${S.mtab === k}" data-act="mtab" data-v="${k}">${svg(ic)}${l}</button>`).join('')}</nav>
-  ${S.sheet === 'pickStudent' ? mPickSheet() : ''}${S.sheet === 'memo' ? mMemoSheet() : ''}`;
+  <nav class="tabbar" aria-label="주요 메뉴">${tabs.map(([k, l, ic]) => `<button aria-current="${S.mtab === k}" data-act="mtab" data-v="${k}">${svg(ic)}${l}${k === 'home' && nCon ? `<i class="tbadge" aria-label="상담 요청 ${nCon}건">${nCon}</i>` : ''}</button>`).join('')}</nav>
+  ${S.sheet === 'pickStudent' ? mPickSheet() : ''}${S.sheet === 'memo' ? mMemoSheet() : ''}${S.sheet === 'report' ? mReportSheet() : ''}`;
 }
 function mHome() {
   const c = counts();
@@ -556,6 +756,8 @@ function mHome() {
       <div class="mtile"><span>판단 나옴</span><b>${c.judged}<small style="font-size:12px;color:var(--muted);font-weight:400">명</small></b></div>
       <div class="mtile ${pending.length ? 'warn' : ''}"><span>입력 대기</span><b>${pending.length}</b></div>
     </div>
+    ${pendingConsults().length ? `<div class="msec"><span class="lab"><b style="color:var(--bad)">학부모 상담 요청 ${pendingConsults().length}건</b></span>
+      <div class="mlist">${pendingConsults().map(r => `<div class="mrow"><button class="grow" style="all:unset;flex:1;cursor:pointer;display:flex;flex-direction:column" data-act="mOpen" data-id="${r.sid}"><b>${esc(r.name)}</b><small>${esc(r.teacher || '')} · ${dt(r.consultAt)} 요청</small></button><button class="btn small" data-act="handled" data-v="${r.id}">처리 완료</button></div>`).join('')}</div></div>` : ''}
     <button class="btn big" data-act="mtab" data-v="entry">${svg('edit', 20)} 점수 바로 입력</button>
     <div class="msec"><span class="lab"><b style="color:var(--fg)">점수 입력 대기</b> · 응시했는데 점수가 없음${S.role === 'teacher' && S.myName ? ' (내 담당)' : ''}</span>
       ${pending.length ? `<div class="mlist">${pending.slice(0, 8).map(({ s, x }) => `<button class="mrow" data-act="quickEntry" data-id="${s.id}" data-r="${x.r}"><span class="grow"><b>${esc(s.name)}</b><small>${x.r}회 · ${esc(x.sch)}${x.date ? ' · ' + esc(x.date) : ''}</small></span><span class="go">입력 ›</span></button>`).join('')}</div>${pending.length > 8 ? `<span class="src">외 ${pending.length - 8}건</span>` : ''}` : '<div class="mlist"><div class="mrow"><span class="grow"><small>대기 중인 점수가 없습니다</small></span></div></div>'}</div>
@@ -638,8 +840,30 @@ function mDetail(s) {
     <div class="cgrid" style="grid-template-columns:repeat(2,minmax(0,1fr))">
       <button class="btn big" data-act="quickEntry" data-id="${s.id}" data-r="${(recs(s).find(x => x.score == null && x.sch) || {}).r || 1}">점수 입력</button>
       <button class="btn big ghost" data-act="sheet" data-v="memo">메모 보기</button></div>
+    <button class="btn big ${isFinal(s) ? '' : 'ghost'}" data-act="sheet" data-v="report">학부모 리포트 보내기 <span class="pill ${repState(s).c}" style="margin-left:6px">${repState(s).t}</span></button>
     <div class="panel box"><b style="font-size:14px">성별</b> <span class="src">남고·여고 자동 제외에 사용</span><div class="cgrid" style="grid-template-columns:repeat(3,minmax(0,1fr));margin-top:8px">${[['', '미입력'], ['남', '남'], ['여', '여']].map(([k, l]) => `<button class="cbtn" aria-pressed="${(s.sex || '') === k}" data-act="mSex" data-id="${s.id}" data-v="${k}">${l}</button>`).join('')}</div></div>
   </div>`;
+}
+function mReportSheet() {
+  const s = stu(S.curId); if (!s) return '';
+  const fin = isFinal(s), r = repFor(s.id), o = repOpt(s), live = r && !expired(r);
+  const changed = r && fin && snapKey(r.data || {}) !== snapKey(buildSnapshot(s));
+  return `<div class="sheet" data-act="closeSheet"><div class="in" data-stop="1" role="dialog" aria-label="학부모 리포트 보내기">
+    <div class="row" style="justify-content:space-between"><b style="font-size:17px">학부모 리포트 보내기</b><button class="btn ghost small" data-act="closeSheet">닫기</button></div>
+    <div class="list" style="display:flex;flex-direction:column;gap:12px">
+      <div class="row" style="justify-content:space-between"><span>${esc(s.name)} · 최종 결과</span><span class="pill ${repState(s).c}">${repState(s).t}</span></div>
+      ${fin ? '' : '<div class="banner">2차(4~6회) 점수까지 들어와 최종 판단이 나오면 보낼 수 있습니다.</div>'}
+      <div><span class="src">참고 등급</span><div class="cgrid" style="grid-template-columns:repeat(2,minmax(0,1fr));margin-top:6px">
+        <button class="cbtn" aria-pressed="${o.grade}" data-act="mRepGrade" data-id="${s.id}" data-v="1">보이기</button><button class="cbtn" aria-pressed="${!o.grade}" data-act="mRepGrade" data-id="${s.id}" data-v="0">숨기기</button></div></div>
+      <button class="btn big" data-act="repShare" data-id="${s.id}" ${fin ? '' : 'disabled'}>카카오톡·문자로 보내기</button>
+      <div class="cgrid" style="grid-template-columns:repeat(2,minmax(0,1fr))">
+        <button class="btn ghost" data-act="repLink" data-id="${s.id}" ${fin || live ? '' : 'disabled'}>링크만 복사</button>
+        ${live ? `<a class="btn ghost" style="display:flex;align-items:center;justify-content:center;text-decoration:none" href="${esc(linkFor(r.id))}" target="_blank" rel="noopener">리포트 보기</a>` : `<button class="btn ghost" disabled>리포트 보기</button>`}</div>
+      ${changed ? `<button class="btn ghost" data-act="repResend" data-id="${s.id}">바뀐 내용으로 새로 고쳐 다시 보내기</button>` : ''}
+      ${r && r.consult === 'requested' && !r.handledAt ? `<button class="btn" data-act="handled" data-v="${r.id}">상담 요청 처리 완료</button>` : ''}
+      <div class="panel box">${reportRecord(r)}</div>
+      <span class="src">보내기를 누르면 핸드폰 공유 창이 열립니다. 카카오톡에서 학부모를 고르세요. 링크는 받은 날부터 한 달간 열립니다. 선생님 의견 작성은 PC·아이패드에서 합니다.</span>
+    </div></div></div>`;
 }
 function mMemoSheet() {
   const s = stu(S.curId); if (!s) return '';
@@ -652,6 +876,7 @@ function mMore() {
   <div class="mbody">
     <div class="panel box"><b>내 계정</b><p style="margin:6px 0 10px">${esc(S.user.email)}<br><span class="src">${isOwner() ? '원장 (모든 권한)' : esc(S.myName || '선생님')}</span></p><button class="btn ghost small" data-act="logout">로그아웃</button></div>
     <div class="panel box"><b>앱 설치</b><div style="margin-top:8px">${installBlock()}</div></div>
+    <div class="panel box"><b>상담 요청 알림</b><div style="margin-top:8px">${notifyBlock()}</div></div>
     <div class="panel box"><b>학교 기준값</b><p class="src" style="margin:4px 0 8px">고1 수학 공시 평균 / 표준편차 (판단 기준)</p>
       <div class="mlist">${Object.keys(SCH).map(sch => { const r = refFor(sch); return `<div class="mrow" style="min-height:44px"><span class="grow"><b style="font-size:14px">${esc(sch)}</b></span><small>${r ? `${r.m} / ${r.sd}` : '없음'}</small></div>`; }).join('')}</div></div>
     <p class="src">학생 추가·삭제, 기준값 수정, 선생님 관리, 자료 가져오기·내보내기는 PC·아이패드 화면의 '설정'에서 합니다.</p>
@@ -718,6 +943,7 @@ document.addEventListener('change', e => {
   else if (k === 'eSchool') { S.entry.sch = el.value; render(); }
   else if (k === 'eYear') { S.entry.y = el.value; }
   else if (k === 'eStage') { S.entry.stage = el.value; }
+  else if (k === 'repOpt') { const s = stu(id); const o = { ...repOpt(s), [el.dataset.k]: el.checked }; s.reportOpt = o; saveStudent(id, { reportOpt: o }, null); render(); }
   else if (k === 'ref') {
     const sch = el.dataset.s, cur = { ...(S.refInput[sch] || {}) };
     cur[el.dataset.k] = el.value === '' ? null : parseFloat(el.value);
@@ -740,7 +966,7 @@ document.addEventListener('click', e => {
   const el = e.target.closest('[data-act]'); if (!el) return;
   if (el.dataset.act === 'closeSheet' && e.target.closest('[data-stop]') && !e.target.closest('button[data-act="closeSheet"]')) return;
   const { act, v, id } = el.dataset;
-  if (act !== 'delStudent' && act !== 'staffDel' && act !== 'delEntry') S.armed = null;
+  if (act !== 'delStudent' && act !== 'staffDel' && act !== 'delEntry' && act !== 'repRevoke') S.armed = null;
   switch (act) {
     case 'login': login(); return;
     case 'logout': S.curId = null; S.students = []; signOut(auth); return;
@@ -784,7 +1010,7 @@ document.addEventListener('click', e => {
     case 'sheet': S.sheet = v; break;
     case 'closeSheet': S.sheet = null; break;
     case 'pickForEntry': setEntry(id, S.entry.r); S.sheet = null; break;
-    case 'mOpen': S.curId = id; S.mDetail = true; window.scrollTo(0, 0); break;
+    case 'mOpen': S.curId = id; S.mDetail = true; S.mtab = 'students'; S.sheet = null; window.scrollTo(0, 0); break;
     case 'mBack': S.mDetail = false; break;
     case 'mSex': saveStudent(id, { sex: v }); stu(id).sex = v; break;
     case 'staffAdd': {
@@ -801,6 +1027,20 @@ document.addEventListener('click', e => {
     case 'exportCsv': exportCsv(); return;
     case 'importGo': importGo(); return;
     case 'importCancel': S.importPending = null; break;
+    case 'saveRepCmt': { const s = stu(id); const txt = (S.repDraft[id] ?? s.reportComment ?? '').slice(0, 400); saveStudent(id, { reportComment: txt }, '의견 저장됨'); s.reportComment = txt; delete S.repDraft[id]; break; }
+    case 'repImage': copyImage(stu(id)); return;
+    case 'repPrint': printReport(stu(id)); return;
+    case 'repCopy': linkAction(stu(id), 'copy'); return;
+    case 'repLink': linkAction(stu(id), 'link'); return;
+    case 'repShare': linkAction(stu(id), 'share'); return;
+    case 'repResend': { const s = stu(id); if (sendReport(s)) linkAction(s, isPhone() && navigator.share ? 'share' : 'copy'); return; }
+    case 'repRevoke':
+      if (S.armed !== 'rev:' + v) { S.armed = 'rev:' + v; break; }
+      S.armed = null; deleteDoc(doc(db, 'reports', v)).then(() => toast('링크를 끊었습니다. 학부모는 더 이상 열 수 없습니다')).catch(err => toast(failMsg(err), true));
+      S.reports = S.reports.filter(r => r.id !== v); break;
+    case 'handled': markHandled(v); break;
+    case 'mRepGrade': { const s = stu(id); const o = { ...repOpt(s), grade: v === '1' }; s.reportOpt = o; saveStudent(id, { reportOpt: o }, null); break; }
+    case 'notifyOn': Notification.requestPermission().then(() => render()); return;
     case 'install': if (S.installEvt) { S.installEvt.prompt(); S.installEvt.userChoice.finally(() => { S.installEvt = null; render(); }); } return;
     default: return;
   }
